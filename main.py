@@ -1,7 +1,7 @@
 import cv2
 import numpy as np
 import math
-from numba import jit, njit
+from numba import jit, njit, prange
 import time
 from concurrent.futures import ThreadPoolExecutor
 
@@ -10,13 +10,12 @@ import numba
 numba.config.CACHE_DIR = './numba_cache'
 
 class Equirectangular360:
-    def __init__(self, video_path, use_optimized_coords=True, max_memory_cache_mb=100):
+    def __init__(self, video_path, use_optimized_coords=True):
         self.video_path = video_path
         self.cap = cv2.VideoCapture(video_path)
         
         # Optimization settings
         self.use_optimized_coords = use_optimized_coords
-        self.max_memory_cache_mb = max_memory_cache_mb
         
         # Optimize video capture settings for speed
         self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)  # Reduce buffer to prevent lag
@@ -606,24 +605,25 @@ class Equirectangular360:
             
             key = cv2.waitKey(0) & 0xFF
             
+            step = 0.1
             if key == 27:  # ESC
                 break
             elif key == ord('a'):
-                yaw -= 5
+                yaw -= step
             elif key == ord('d'):
-                yaw += 5
+                yaw += step
             elif key == ord('w'):
-                pitch += 5
+                pitch += step
             elif key == ord('s'):
-                pitch -= 5
+                pitch -= step
             elif key == ord('q'):
-                roll -= 5
+                roll -= step
             elif key == ord('e'):
-                roll += 5
+                roll += step
             elif key == ord('z'):
-                fov = max(10, fov - 5)
+                fov = max(10, fov - step)
             elif key == ord('x'):
-                fov = min(120, fov + 5)
+                fov = min(360, fov + step)
             elif key == ord('b'):
                 benchmark = not benchmark
                 print(f"Benchmark mode: {'ON' if benchmark else 'OFF'}")
@@ -986,8 +986,8 @@ def generate_mapping_jit_parallel(output_width, output_height, focal_length, cx,
     frame_width_minus_1 = frame_width - 1
     frame_height_minus_1 = frame_height - 1
     
-    # Process rows in parallel
-    for j in range(output_height):
+    # Process rows in parallel using prange
+    for j in prange(output_height):
         y_norm = (j - cy) * inv_focal
         for i in range(output_width):
             x_norm = (i - cx) * inv_focal
@@ -1071,7 +1071,7 @@ def generate_mapping_jit_ultra(output_width, output_height, focal_length, cx, cy
 def generate_mapping_jit_ultra_parallel(output_width, output_height, focal_length, cx, cy,
                                        R00, R01, R02, R10, R11, R12, R20, R21, R22,
                                        frame_height, frame_width):
-    """Ultra-optimized parallel coordinate mapping for multi-core systems"""
+    """Ultra-optimized parallel coordinate mapping using a flattened approach for better Numba parallelization"""
     
     # Pre-allocate output arrays
     pixel_x = np.empty((output_height, output_width), dtype=np.float32)
@@ -1086,34 +1086,40 @@ def generate_mapping_jit_ultra_parallel(output_width, output_height, focal_lengt
     frame_height_f = float(frame_height - 1)
     pi = 3.141592653589793
     
-    # Parallel processing with optimized inner loop
-    for j in range(output_height):
+    # Flatten to 1D for better parallelization
+    total_pixels = output_height * output_width
+    
+    # Use prange for parallel processing of individual pixels
+    for idx in prange(total_pixels):
+        # Convert 1D index back to 2D coordinates
+        j = idx // output_width
+        i = idx % output_width
+        
+        # Same calculation as before
+        x_norm = (i - cx) * inv_focal
         y_norm = (j - cy) * inv_focal
-        y_norm_sq = y_norm * y_norm
-        for i in range(output_width):
-            x_norm = (i - cx) * inv_focal
-            
-            # Fast normalization
-            norm_factor = 1.0 / math.sqrt(x_norm * x_norm + y_norm_sq + 1.0)
-            x_unit = x_norm * norm_factor
-            y_unit = y_norm * norm_factor
-            z_unit = norm_factor
-            
-            # Matrix multiply
-            x_rot = R00 * x_unit + R01 * y_unit + R02 * z_unit
-            y_rot = R10 * x_unit + R11 * y_unit + R12 * z_unit
-            z_rot = R20 * x_unit + R21 * y_unit + R22 * z_unit
-            
-            # Spherical conversion
-            theta = math.atan2(x_rot, z_rot)
-            phi = math.asin(max(-1.0, min(1.0, y_rot)))
-            
-            # Pixel mapping
-            u = (theta + pi) * inv_2pi
-            v = (phi + half_pi) * inv_pi
-            
-            pixel_x[j, i] = max(0.0, min(frame_width_f, u * frame_width_f))
-            pixel_y[j, i] = max(0.0, min(frame_height_f, v * frame_height_f))
+        
+        # Fast normalization
+        norm_factor = 1.0 / math.sqrt(x_norm * x_norm + y_norm * y_norm + 1.0)
+        x_unit = x_norm * norm_factor
+        y_unit = y_norm * norm_factor
+        z_unit = norm_factor
+        
+        # Matrix multiply
+        x_rot = R00 * x_unit + R01 * y_unit + R02 * z_unit
+        y_rot = R10 * x_unit + R11 * y_unit + R12 * z_unit
+        z_rot = R20 * x_unit + R21 * y_unit + R22 * z_unit
+        
+        # Spherical conversion
+        theta = math.atan2(x_rot, z_rot)
+        phi = math.asin(max(-1.0, min(1.0, y_rot)))
+        
+        # Pixel mapping
+        u = (theta + pi) * inv_2pi
+        v = (phi + half_pi) * inv_pi
+        
+        pixel_x[j, i] = max(0.0, min(frame_width_f, u * frame_width_f))
+        pixel_y[j, i] = max(0.0, min(frame_height_f, v * frame_height_f))
     
     return pixel_x, pixel_y
 
@@ -1123,7 +1129,7 @@ def main():
     video_path = "C:/insta360/x5/exports/VID_20250704_123015_00_001(1).mp4"
  
     # Create processor with ultra-fast coordinate generation and minimal memory cache
-    processor = Equirectangular360(video_path, use_optimized_coords=True, max_memory_cache_mb=50)
+    processor = Equirectangular360(video_path, use_optimized_coords=True)
     
     print(f"Video loaded: {processor.width}x{processor.height}")
     print("Ultra-fast coordinate generation enabled with JIT compilation")
@@ -1131,9 +1137,9 @@ def main():
     print()
     
     # Test coordinate generation performance first
-    print("Testing coordinate generation performance...")
-    processor.benchmark_coordinate_generation()
-    print()
+    # print("Testing coordinate generation performance...")
+    # processor.benchmark_coordinate_generation()
+    # print()
     
     # Option 1: Interactive viewer with real-time performance
     print("Starting interactive viewer...")
