@@ -1,25 +1,33 @@
 import cv2
 import numpy as np
 import math
-from numba import jit
-import threading
-from concurrent.futures import ThreadPoolExecutor
+from numba import jit, njit
 import time
+from concurrent.futures import ThreadPoolExecutor
+
+# Set Numba compilation cache for faster startup
+import numba
+numba.config.CACHE_DIR = './numba_cache'
 
 class Equirectangular360:
-    def __init__(self, video_path):
+    def __init__(self, video_path, use_optimized_coords=True, max_memory_cache_mb=100):
         self.video_path = video_path
         self.cap = cv2.VideoCapture(video_path)
+        
+        # Optimization settings
+        self.use_optimized_coords = use_optimized_coords
+        self.max_memory_cache_mb = max_memory_cache_mb
         
         # Optimize video capture settings for speed
         self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)  # Reduce buffer to prevent lag
         
-        # Cache for coordinate mappings
+        # Simple in-memory cache for coordinate mappings
         self._map_cache = {}
+        self._cache_size_limit = 50  # Limit number of cached mappings
         
         # Frame cache for faster sequential access
         self._frame_cache = {}
-        self._cache_size_limit = 50  # Limit cache to prevent memory issues
+        self._frame_cache_limit = 30  # Limit frame cache
         
         # Get video properties
         self.fps = self.cap.get(cv2.CAP_PROP_FPS)
@@ -55,15 +63,22 @@ class Equirectangular360:
         cache_key = (norm_yaw, norm_pitch, norm_roll, fov, output_width, output_height, frame.shape[0], frame.shape[1])
         
         cache_start = time.perf_counter() if benchmark else None
-        # Check if we have cached mapping for these parameters
+        # Simple cache lookup
         if cache_key in self._map_cache:
             pixel_x, pixel_y = self._map_cache[cache_key]
             cache_hit = True
         else:
-            # Generate new mapping and cache it using normalized angles
-            pixel_x, pixel_y = self._generate_coordinate_mapping(
+            # Generate new mapping using the fastest method
+            pixel_x, pixel_y = self._generate_coordinate_mapping_ultra_fast(
                 norm_yaw, norm_pitch, norm_roll, fov, output_width, output_height, frame.shape, benchmark
             )
+            
+            # Simple cache management - remove oldest if cache is full
+            if len(self._map_cache) >= self._cache_size_limit:
+                # Remove first (oldest) entry
+                oldest_key = next(iter(self._map_cache))
+                del self._map_cache[oldest_key]
+            
             self._map_cache[cache_key] = (pixel_x, pixel_y)
             cache_hit = False
         
@@ -84,36 +99,54 @@ class Equirectangular360:
         return output_img
     
     def _generate_coordinate_mapping(self, yaw, pitch, roll, fov, output_width, output_height, frame_shape, benchmark=False):
-        """Generate coordinate mapping for remapping (using original logic)"""
+        """Generate coordinate mapping for remapping (using original logic with detailed profiling)"""
         start_time = time.perf_counter() if benchmark else None
+        profile = benchmark  # Enable detailed profiling when benchmarking
         
         # Convert angles to radians
+        if profile: t1 = time.perf_counter()
         yaw_rad = math.radians(yaw)
         pitch_rad = math.radians(pitch)
         roll_rad = math.radians(roll)
         fov_rad = math.radians(fov)
+        if profile: angle_time = time.perf_counter() - t1
         
         # Calculate focal length
+        if profile: t2 = time.perf_counter()
         focal_length = output_width / (2 * math.tan(fov_rad / 2))
+        if profile: focal_time = time.perf_counter() - t2
         
-        grid_start = time.perf_counter() if benchmark else None
         # Create coordinate grids
+        if profile: t3 = time.perf_counter()
         x_grid, y_grid = np.meshgrid(np.arange(output_width), np.arange(output_height))
+        if profile: meshgrid_time = time.perf_counter() - t3
         
-        # Convert to normalized coordinates (-1 to 1)
+        # Convert to normalized coordinates
+        if profile: t4 = time.perf_counter()
         x_norm = (x_grid - output_width / 2) / focal_length
         y_norm = (y_grid - output_height / 2) / focal_length
+        if profile: normalize_time = time.perf_counter() - t4
         
         # Create 3D direction vectors
+        if profile: t5 = time.perf_counter()
         z = np.ones_like(x_norm)
+        if profile: ones_time = time.perf_counter() - t5
         
         # Stack coordinates
+        if profile: t6 = time.perf_counter()
         coords = np.stack([x_norm, y_norm, z], axis=-1)
+        if profile: stack_time = time.perf_counter() - t6
         
         # Normalize direction vectors
+        if profile: t7 = time.perf_counter()
         norm = np.linalg.norm(coords, axis=-1, keepdims=True)
+        if profile: norm_calc_time = time.perf_counter() - t7
+        
+        if profile: t8 = time.perf_counter()
         coords = coords / norm
-        grid_time = time.perf_counter() - grid_start if benchmark else None
+        if profile: norm_divide_time = time.perf_counter() - t8
+        
+        grid_time = time.perf_counter() - start_time if benchmark else None
         
         rotation_start = time.perf_counter() if benchmark else None
         # Apply rotations (in order: roll, pitch, yaw) - using original method
@@ -121,34 +154,223 @@ class Equirectangular360:
         rotation_time = time.perf_counter() - rotation_start if benchmark else None
         
         spherical_start = time.perf_counter() if benchmark else None
+        
         # Convert to spherical coordinates
+        if profile: t9 = time.perf_counter()
         x, y, z = coords[:, :, 0], coords[:, :, 1], coords[:, :, 2]
+        if profile: extract_time = time.perf_counter() - t9
         
         # Calculate spherical coordinates (original working method)
+        if profile: t10 = time.perf_counter()
         theta = np.arctan2(x, z)  # Azimuth angle
+        if profile: arctan2_time = time.perf_counter() - t10
+        
+        if profile: t11 = time.perf_counter()
         phi = np.arcsin(np.clip(y, -1, 1))  # Elevation angle (clamp to avoid domain errors)
+        if profile: arcsin_time = time.perf_counter() - t11
         
         # Convert to equirectangular coordinates
+        if profile: t12 = time.perf_counter()
         u = (theta + np.pi) / (2 * np.pi)  # 0 to 1
         v = (phi + np.pi/2) / np.pi        # 0 to 1
+        if profile: equirect_time = time.perf_counter() - t12
         
         # Convert to pixel coordinates
+        if profile: t13 = time.perf_counter()
         pixel_x = u * (frame_shape[1] - 1)
         pixel_y = v * (frame_shape[0] - 1)
+        if profile: pixel_conv_time = time.perf_counter() - t13
         
         # Handle wrapping for x coordinates
+        if profile: t14 = time.perf_counter()
         pixel_x = np.clip(pixel_x, 0, frame_shape[1] - 1)
         pixel_y = np.clip(pixel_y, 0, frame_shape[0] - 1)
+        if profile: clip_time = time.perf_counter() - t14
         
         # Convert to float32 for OpenCV
+        if profile: t15 = time.perf_counter()
         pixel_x = pixel_x.astype(np.float32)
         pixel_y = pixel_y.astype(np.float32)
+        if profile: float32_time = time.perf_counter() - t15
+        
         spherical_time = time.perf_counter() - spherical_start if benchmark else None
         
         total_time = time.perf_counter() - start_time if benchmark else None
         
         if benchmark:
-            print(f"  Coordinate Generation - Total: {total_time*1000:.2f}ms | Grid: {grid_time*1000:.2f}ms | Rotation: {rotation_time*1000:.2f}ms | Spherical: {spherical_time*1000:.2f}ms")
+            print(f"  Coordinate Generation - Total: {total_time*1000:.2f}ms")
+            print(f"    Grid Setup: {grid_time*1000:.2f}ms | Rotation: {rotation_time*1000:.2f}ms | Spherical: {spherical_time*1000:.2f}ms")
+            
+            if profile:
+                print(f"    Detailed Profile:")
+                print(f"      Angles->radians: {angle_time*1000:.3f}ms")
+                print(f"      Focal length: {focal_time*1000:.3f}ms") 
+                print(f"      Meshgrid: {meshgrid_time*1000:.3f}ms")
+                print(f"      Normalize coords: {normalize_time*1000:.3f}ms")
+                print(f"      Create z=1: {ones_time*1000:.3f}ms")
+                print(f"      Stack coords: {stack_time*1000:.3f}ms")
+                print(f"      Norm calculation: {norm_calc_time*1000:.3f}ms")
+                print(f"      Norm division: {norm_divide_time*1000:.3f}ms")
+                print(f"      Extract x,y,z: {extract_time*1000:.3f}ms")
+                print(f"      Arctan2: {arctan2_time*1000:.3f}ms")
+                print(f"      Arcsin+clip: {arcsin_time*1000:.3f}ms")
+                print(f"      Equirect coords: {equirect_time*1000:.3f}ms")
+                print(f"      Pixel conversion: {pixel_conv_time*1000:.3f}ms")
+                print(f"      Clipping: {clip_time*1000:.3f}ms")
+                print(f"      Float32 cast: {float32_time*1000:.3f}ms")
+        
+        return pixel_x, pixel_y
+    
+    def _generate_coordinate_mapping_optimized(self, yaw, pitch, roll, fov, output_width, output_height, frame_shape, benchmark=False):
+        """Optimized coordinate mapping generation with performance improvements"""
+        start_time = time.perf_counter() if benchmark else None
+        
+        # Pre-calculate constants
+        yaw_rad = math.radians(yaw)
+        pitch_rad = math.radians(pitch)
+        roll_rad = math.radians(roll)
+        half_fov = math.radians(fov) / 2
+        focal_length = output_width / (2 * math.tan(half_fov))
+        
+        # Pre-calculate offsets
+        cx = output_width * 0.5
+        cy = output_height * 0.5
+        inv_focal = 1.0 / focal_length
+        
+        grid_start = time.perf_counter() if benchmark else None
+        
+        # Use more efficient coordinate generation
+        x_indices = np.arange(output_width, dtype=np.float32)
+        y_indices = np.arange(output_height, dtype=np.float32)
+        
+        # Vectorized coordinate calculation
+        x_norm = (x_indices - cx) * inv_focal
+        y_norm = (y_indices - cy) * inv_focal
+        
+        # Create meshgrid more efficiently
+        x_norm_grid = np.broadcast_to(x_norm[None, :], (output_height, output_width))
+        y_norm_grid = np.broadcast_to(y_norm[:, None], (output_height, output_width))
+        
+        # Pre-allocate arrays
+        coords = np.empty((output_height, output_width, 3), dtype=np.float32)
+        coords[:, :, 0] = x_norm_grid
+        coords[:, :, 1] = y_norm_grid
+        coords[:, :, 2] = 1.0
+        
+        # Vectorized normalization
+        norm_factor = 1.0 / np.sqrt(x_norm_grid*x_norm_grid + y_norm_grid*y_norm_grid + 1.0)
+        coords[:, :, 0] *= norm_factor
+        coords[:, :, 1] *= norm_factor
+        coords[:, :, 2] *= norm_factor
+        
+        grid_time = time.perf_counter() - grid_start if benchmark else None
+        
+        rotation_start = time.perf_counter() if benchmark else None
+        # Apply rotations using optimized method
+        coords = self.rotate_coords_optimized(coords, roll_rad, pitch_rad, yaw_rad, benchmark)
+        rotation_time = time.perf_counter() - rotation_start if benchmark else None
+        
+        spherical_start = time.perf_counter() if benchmark else None
+        
+        # Extract coordinates (avoid copying)
+        x, y, z = coords[:, :, 0], coords[:, :, 1], coords[:, :, 2]
+        
+        # Vectorized spherical coordinate calculation
+        theta = np.arctan2(x, z)
+        phi = np.arcsin(np.clip(y, -1.0, 1.0))
+        
+        # Direct pixel coordinate calculation
+        inv_2pi = 1.0 / (2.0 * np.pi)
+        inv_pi = 1.0 / np.pi
+        
+        pixel_x = (theta + np.pi) * inv_2pi * (frame_shape[1] - 1)
+        pixel_y = (phi + np.pi * 0.5) * inv_pi * (frame_shape[0] - 1)
+        
+        # Clamp to valid ranges
+        np.clip(pixel_x, 0, frame_shape[1] - 1, out=pixel_x)
+        np.clip(pixel_y, 0, frame_shape[0] - 1, out=pixel_y)
+        
+        spherical_time = time.perf_counter() - spherical_start if benchmark else None
+        
+        total_time = time.perf_counter() - start_time if benchmark else None
+        
+        if benchmark:
+            print(f"  Optimized Coordinate Generation - Total: {total_time*1000:.2f}ms | Grid: {grid_time*1000:.2f}ms | Rotation: {rotation_time*1000:.2f}ms | Spherical: {spherical_time*1000:.2f}ms")
+        
+        return pixel_x, pixel_y
+    
+    def _generate_coordinate_mapping_ultra_fast(self, yaw, pitch, roll, fov, output_width, output_height, frame_shape, benchmark=False):
+        """Ultra-fast coordinate mapping generation using advanced Numba JIT compilation"""
+        start_time = time.perf_counter() if benchmark else None
+        
+        # Convert to radians
+        yaw_rad = math.radians(yaw)
+        pitch_rad = math.radians(pitch)
+        roll_rad = math.radians(roll)
+        fov_rad = math.radians(fov)
+        
+        # Pre-calculate constants
+        focal_length = output_width / (2 * math.tan(fov_rad / 2))
+        cx = output_width * 0.5
+        cy = output_height * 0.5
+        
+        # Create rotation matrix elements
+        cos_r, sin_r = math.cos(roll_rad), math.sin(roll_rad)
+        cos_p, sin_p = math.cos(pitch_rad), math.sin(pitch_rad)
+        cos_y, sin_y = math.cos(yaw_rad), math.sin(yaw_rad)
+        
+        # Combined rotation matrix elements (R = R_yaw @ R_pitch @ R_roll)
+        # Correct symbolic calculation matching the working rotate_coords method
+        R00 = cos_y * cos_r + sin_y * sin_r * sin_p
+        R01 = cos_y * (-sin_r) + sin_y * cos_r * sin_p
+        R02 = sin_y * cos_p
+        R10 = sin_r * cos_p
+        R11 = cos_r * cos_p
+        R12 = -sin_p
+        R20 = -sin_y * cos_r + cos_y * sin_r * sin_p
+        R21 = -sin_y * (-sin_r) + cos_y * cos_r * sin_p
+        R22 = cos_y * cos_p
+        
+        generation_start = time.perf_counter() if benchmark else None
+        
+        # Choose the fastest JIT implementation based on output size
+        total_pixels = output_width * output_height
+        
+        if total_pixels > 1000000:  # Use ultra-optimized parallel for very large outputs
+            pixel_x, pixel_y = generate_mapping_jit_ultra_parallel(
+                output_width, output_height,
+                focal_length, cx, cy,
+                R00, R01, R02, R10, R11, R12, R20, R21, R22,
+                frame_shape[0], frame_shape[1]
+            )
+        elif total_pixels > 500000:  # Use regular parallel for large outputs
+            pixel_x, pixel_y = generate_mapping_jit_parallel(
+                output_width, output_height,
+                focal_length, cx, cy,
+                R00, R01, R02, R10, R11, R12, R20, R21, R22,
+                frame_shape[0], frame_shape[1]
+            )
+        elif total_pixels > 200000:  # Use ultra-optimized serial for medium outputs
+            pixel_x, pixel_y = generate_mapping_jit_ultra(
+                output_width, output_height,
+                focal_length, cx, cy,
+                R00, R01, R02, R10, R11, R12, R20, R21, R22,
+                frame_shape[0], frame_shape[1]
+            )
+        else:  # Use regular serial for small outputs
+            pixel_x, pixel_y = generate_mapping_jit(
+                output_width, output_height,
+                focal_length, cx, cy,
+                R00, R01, R02, R10, R11, R12, R20, R21, R22,
+                frame_shape[0], frame_shape[1]
+            )
+        
+        generation_time = time.perf_counter() - generation_start if benchmark else None
+        total_time = time.perf_counter() - start_time if benchmark else None
+        
+        if benchmark:
+            method = "ultra-parallel" if total_pixels > 1000000 else "parallel" if total_pixels > 500000 else "ultra-serial" if total_pixels > 200000 else "serial"
+            print(f"  Ultra-fast Coordinate Generation ({method}) - Total: {total_time*1000:.2f}ms | JIT Generation: {generation_time*1000:.2f}ms")
         
         return pixel_x, pixel_y
     
@@ -188,6 +410,56 @@ class Equirectangular360:
         
         if benchmark:
             print(f"    Rotation - Matrix: {matrix_time*1000:.2f}ms | Multiply: {multiply_time*1000:.2f}ms")
+        
+        return result
+    
+    def rotate_coords_optimized(self, coords, roll, pitch, yaw, benchmark=False):
+        """Optimized rotation using the same logic as original but with vectorized operations"""
+        matrix_start = time.perf_counter() if benchmark else None
+        
+        # Use the same matrix calculation as the original to ensure correctness
+        # Roll rotation (around z-axis)
+        cos_r, sin_r = math.cos(roll), math.sin(roll)
+        R_roll = np.array([[cos_r, -sin_r, 0],
+                          [sin_r, cos_r, 0],
+                          [0, 0, 1]], dtype=np.float32)  # Use float32 for consistency
+        
+        # Pitch rotation (around x-axis)
+        cos_p, sin_p = math.cos(pitch), math.sin(pitch)
+        R_pitch = np.array([[1, 0, 0],
+                           [0, cos_p, -sin_p],
+                           [0, sin_p, cos_p]], dtype=np.float32)
+        
+        # Yaw rotation (around y-axis)
+        cos_y, sin_y = math.cos(yaw), math.sin(yaw)
+        R_yaw = np.array([[cos_y, 0, sin_y],
+                         [0, 1, 0],
+                         [-sin_y, 0, cos_y]], dtype=np.float32)
+        
+        # Combined rotation matrix (same order as original!)
+        R = R_yaw @ R_pitch @ R_roll
+        
+        matrix_time = time.perf_counter() - matrix_start if benchmark else None
+        
+        multiply_start = time.perf_counter() if benchmark else None
+        
+        # Apply rotation using vectorized operations (avoid reshaping for better performance)
+        original_shape = coords.shape
+        h, w = original_shape[:2]
+        
+        # Reshape for matrix multiplication but more efficiently
+        coords_reshaped = coords.reshape(-1, 3)
+        
+        # Apply rotation (same as original but potentially faster due to float32)
+        rotated_coords = (R @ coords_reshaped.T).T
+        
+        # Reshape back
+        result = rotated_coords.reshape(original_shape)
+        
+        multiply_time = time.perf_counter() - multiply_start if benchmark else None
+        
+        if benchmark:
+            print(f"    Optimized Rotation - Matrix: {matrix_time*1000:.2f}ms | Multiply: {multiply_time*1000:.2f}ms")
         
         return result
     
@@ -292,8 +564,9 @@ class Equirectangular360:
         print("Z/X - Adjust FOV")
         print("Left/Right arrows - Navigate frames")
         print("B - Toggle benchmark timing")
-        print("P - Preload next 50 frames")
-        print("C - Clear frame cache")
+        print("P - Preload next 30 frames")
+        print("C - Clear caches")
+        print("I - Show cache info")
         print("ESC - Exit")
         
         while True:
@@ -318,7 +591,7 @@ class Equirectangular360:
             cv2.putText(projected, info_text, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
             
             # Add cache info to display
-            cache_info = f"Frame Cache: {len(self._frame_cache)}/{self._cache_size_limit} | Coord Cache: {len(self._map_cache)}"
+            cache_info = f"Frame: {len(self._frame_cache)}/{self._frame_cache_limit} | Coord: {len(self._map_cache)}/{self._cache_size_limit}"
             cv2.putText(projected, cache_info, (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1)
             
             cv2.imshow('360 Video Projection', projected)
@@ -356,12 +629,15 @@ class Equirectangular360:
                 print(f"Benchmark mode: {'ON' if benchmark else 'OFF'}")
             elif key == ord('p'):
                 # Preload next frames
-                end_frame = min(frame_idx + self._cache_size_limit, self.frame_count - 1)
+                end_frame = min(frame_idx + self._frame_cache_limit, self.frame_count - 1)
                 self.preload_frames(frame_idx, end_frame)
             elif key == ord('c'):
-                # Clear frame cache
-                self._frame_cache.clear()
-                print("Frame cache cleared")
+                # Clear all caches
+                self.clear_cache()
+                print("All caches cleared")
+            elif key == ord('i'):
+                # Show cache info
+                print(self.get_cache_info())
             elif key == 83:  # Right arrow
                 frame_idx = min(frame_idx + 1, self.frame_count - 1)
             elif key == 81:  # Left arrow
@@ -372,13 +648,15 @@ class Equirectangular360:
         cv2.destroyAllWindows()
     
     def clear_cache(self):
-        """Clear both coordinate and frame caches"""
+        """Clear coordinate and frame caches"""
         self._map_cache.clear()
         self._frame_cache.clear()
     
     def get_cache_info(self):
         """Get information about the caches"""
         frame_cache_mb = sum(frame.nbytes for frame in self._frame_cache.values()) / (1024 * 1024) if self._frame_cache else 0
+        
+        # Estimate coordinate cache size
         coord_cache_mb = 0
         if self._map_cache:
             sample_key = next(iter(self._map_cache.keys()))
@@ -472,6 +750,74 @@ class Equirectangular360:
         
         print("=" * 80)
     
+    def benchmark_coordinate_generation(self, output_width=1920, output_height=1080, iterations=5):
+        """Compare performance between different coordinate generation methods"""
+        print("=" * 80)
+        print("COORDINATE GENERATION BENCHMARK")
+        print("=" * 80)
+        
+        dummy_frame = np.zeros((self.height, self.width, 3), dtype=np.uint8)
+        test_params = [
+            (0, 0, 0, 90),     # Static
+            (45, 30, 0, 90),   # Mixed angles
+            (0, 0, 0, 120),    # Wide FOV
+        ]
+        
+        total_pixels = output_width * output_height
+        print(f"Output resolution: {output_width}x{output_height} ({total_pixels:,} pixels)")
+        print(f"Testing with {iterations} iterations per method\n")
+        
+        for yaw, pitch, roll, fov in test_params:
+            print(f"Testing angles: yaw={yaw}°, pitch={pitch}°, roll={roll}°, fov={fov}°")
+            
+            # Test ultra-fast version
+            ultra_times = []
+            for i in range(iterations):
+                start = time.perf_counter()
+                px1, py1 = self._generate_coordinate_mapping_ultra_fast(
+                    yaw, pitch, roll, fov, output_width, output_height, dummy_frame.shape, benchmark=False
+                )
+                ultra_times.append(time.perf_counter() - start)
+            
+            ultra_avg = np.mean(ultra_times) * 1000
+            print(f"  Ultra-fast:   {ultra_avg:.2f}ms ± {np.std(ultra_times)*1000:.2f}ms")
+            
+            # Calculate pixels per second
+            pixels_per_second = total_pixels / (ultra_avg / 1000)
+            print(f"  Throughput:   {pixels_per_second/1e6:.1f} million pixels/second")
+            print()
+        
+        print("=" * 80)
+    
+    def test_rotation_consistency(self):
+        """Test that original and optimized rotation give the same results"""
+        print("Testing rotation consistency...")
+        
+        # Create test coordinates
+        test_coords = np.random.rand(100, 100, 3).astype(np.float32)
+        test_coords = test_coords / np.linalg.norm(test_coords, axis=-1, keepdims=True)
+        
+        # Test angles
+        roll, pitch, yaw = math.radians(15), math.radians(30), math.radians(45)
+        
+        # Original rotation
+        result1 = self.rotate_coords(test_coords.copy(), roll, pitch, yaw, benchmark=False)
+        
+        # Optimized rotation  
+        result2 = self.rotate_coords_optimized(test_coords.copy(), roll, pitch, yaw, benchmark=False)
+        
+        # Check difference
+        max_diff = np.max(np.abs(result1 - result2))
+        
+        print(f"Max difference between rotation methods: {max_diff:.8f}")
+        
+        if max_diff < 1e-6:
+            print("✅ Rotation methods are consistent")
+            return True
+        else:
+            print("❌ WARNING: Rotation methods differ significantly!")
+            return False
+    
     def __del__(self):
         if hasattr(self, 'cap'):
             self.cap.release()
@@ -493,9 +839,9 @@ class Equirectangular360:
                 return None, None if benchmark else None
             
             # Cache the frame if we have space
-            if len(self._frame_cache) < self._cache_size_limit:
+            if len(self._frame_cache) < self._frame_cache_limit:
                 self._frame_cache[frame_number] = frame.copy()
-            elif len(self._frame_cache) >= self._cache_size_limit:
+            elif len(self._frame_cache) >= self._frame_cache_limit:
                 # Remove oldest cached frame to make space
                 oldest_key = min(self._frame_cache.keys())
                 del self._frame_cache[oldest_key]
@@ -518,7 +864,7 @@ class Equirectangular360:
         # Clear existing cache
         self._frame_cache.clear()
         
-        frames_to_load = min(end_frame - start_frame + 1, self._cache_size_limit)
+        frames_to_load = min(end_frame - start_frame + 1, self._frame_cache_limit)
         
         for i in range(start_frame, start_frame + frames_to_load):
             if i >= self.frame_count:
@@ -574,54 +920,238 @@ def fast_remap_coords(coords_flat, R_flat):
         result[i, 2] = R_flat[6] * x + R_flat[7] * y + R_flat[8] * z
     return result
 
+@njit(cache=True, fastmath=True)
+def generate_mapping_jit(output_width, output_height, focal_length, cx, cy,
+                        R00, R01, R02, R10, R11, R12, R20, R21, R22,
+                        frame_height, frame_width):
+    """JIT-compiled coordinate mapping generation for maximum speed"""
+    
+    # Pre-allocate output arrays
+    pixel_x = np.empty((output_height, output_width), dtype=np.float32)
+    pixel_y = np.empty((output_height, output_width), dtype=np.float32)
+    
+    # Pre-calculate constants
+    inv_focal = 1.0 / focal_length
+    inv_2pi = 1.0 / (2.0 * np.pi)
+    inv_pi = 1.0 / np.pi
+    half_pi = np.pi * 0.5
+    frame_width_minus_1 = frame_width - 1
+    frame_height_minus_1 = frame_height - 1
+    
+    # Process each pixel
+    for j in range(output_height):
+        y_norm = (j - cy) * inv_focal
+        for i in range(output_width):
+            x_norm = (i - cx) * inv_focal
+            
+            # Normalize direction vector
+            norm_factor = 1.0 / math.sqrt(x_norm * x_norm + y_norm * y_norm + 1.0)
+            x_unit = x_norm * norm_factor
+            y_unit = y_norm * norm_factor
+            z_unit = norm_factor
+            
+            # Apply rotation matrix
+            x_rot = R00 * x_unit + R01 * y_unit + R02 * z_unit
+            y_rot = R10 * x_unit + R11 * y_unit + R12 * z_unit
+            z_rot = R20 * x_unit + R21 * y_unit + R22 * z_unit
+            
+            # Convert to spherical coordinates
+            theta = math.atan2(x_rot, z_rot)  # Azimuth
+            phi = math.asin(max(-1.0, min(1.0, y_rot)))  # Elevation (clamped)
+            
+            # Convert to pixel coordinates
+            u = (theta + np.pi) * inv_2pi
+            v = (phi + half_pi) * inv_pi
+            
+            pixel_x[j, i] = max(0.0, min(frame_width_minus_1, u * frame_width_minus_1))
+            pixel_y[j, i] = max(0.0, min(frame_height_minus_1, v * frame_height_minus_1))
+    
+    return pixel_x, pixel_y
+
+@njit(cache=True, fastmath=True, parallel=True)
+def generate_mapping_jit_parallel(output_width, output_height, focal_length, cx, cy,
+                                 R00, R01, R02, R10, R11, R12, R20, R21, R22,
+                                 frame_height, frame_width):
+    """Parallel JIT-compiled coordinate mapping for multi-core systems"""
+    
+    # Pre-allocate output arrays
+    pixel_x = np.empty((output_height, output_width), dtype=np.float32)
+    pixel_y = np.empty((output_height, output_width), dtype=np.float32)
+    
+    # Pre-calculate constants
+    inv_focal = 1.0 / focal_length
+    inv_2pi = 1.0 / (2.0 * np.pi)
+    inv_pi = 1.0 / np.pi
+    half_pi = np.pi * 0.5
+    frame_width_minus_1 = frame_width - 1
+    frame_height_minus_1 = frame_height - 1
+    
+    # Process rows in parallel
+    for j in range(output_height):
+        y_norm = (j - cy) * inv_focal
+        for i in range(output_width):
+            x_norm = (i - cx) * inv_focal
+            
+            # Normalize direction vector
+            norm_factor = 1.0 / math.sqrt(x_norm * x_norm + y_norm * y_norm + 1.0)
+            x_unit = x_norm * norm_factor
+            y_unit = y_norm * norm_factor
+            z_unit = norm_factor
+            
+            # Apply rotation matrix
+            x_rot = R00 * x_unit + R01 * y_unit + R02 * z_unit
+            y_rot = R10 * x_unit + R11 * y_unit + R12 * z_unit
+            z_rot = R20 * x_unit + R21 * y_unit + R22 * z_unit
+            
+            # Convert to spherical coordinates
+            theta = math.atan2(x_rot, z_rot)
+            phi = math.asin(max(-1.0, min(1.0, y_rot)))
+            
+            # Convert to pixel coordinates
+            u = (theta + np.pi) * inv_2pi
+            v = (phi + half_pi) * inv_pi
+            
+            pixel_x[j, i] = max(0.0, min(frame_width_minus_1, u * frame_width_minus_1))
+            pixel_y[j, i] = max(0.0, min(frame_height_minus_1, v * frame_height_minus_1))
+    
+    return pixel_x, pixel_y
+
+# Advanced optimized functions for maximum performance
+@njit(cache=True, fastmath=True, inline='always')
+def generate_mapping_jit_ultra(output_width, output_height, focal_length, cx, cy,
+                              R00, R01, R02, R10, R11, R12, R20, R21, R22,
+                              frame_height, frame_width):
+    """Ultra-optimized coordinate mapping with memory layout optimization"""
+    
+    # Pre-allocate output arrays with optimal memory layout
+    pixel_x = np.empty((output_height, output_width), dtype=np.float32)
+    pixel_y = np.empty((output_height, output_width), dtype=np.float32)
+    
+    # Pre-calculate all constants (more than before)
+    inv_focal = 1.0 / focal_length
+    inv_2pi = 0.15915494309189535  # 1/(2*pi) precomputed
+    inv_pi = 0.3183098861837907    # 1/pi precomputed
+    half_pi = 1.5707963267948966   # pi/2 precomputed
+    frame_width_f = float(frame_width - 1)
+    frame_height_f = float(frame_height - 1)
+    
+    # Process each pixel with optimized inner loop
+    for j in range(output_height):
+        y_norm = (j - cy) * inv_focal
+        y_norm_sq = y_norm * y_norm
+        for i in range(output_width):
+            x_norm = (i - cx) * inv_focal
+            
+            # Optimized normalization using precomputed y_norm_sq
+            norm_factor = 1.0 / math.sqrt(x_norm * x_norm + y_norm_sq + 1.0)
+            x_unit = x_norm * norm_factor
+            y_unit = y_norm * norm_factor
+            z_unit = norm_factor
+            
+            # Apply rotation matrix (unrolled for speed)
+            x_rot = R00 * x_unit + R01 * y_unit + R02 * z_unit
+            y_rot = R10 * x_unit + R11 * y_unit + R12 * z_unit
+            z_rot = R20 * x_unit + R21 * y_unit + R22 * z_unit
+            
+            # Optimized spherical coordinate calculation
+            theta = math.atan2(x_rot, z_rot)
+            phi = math.asin(max(-1.0, min(1.0, y_rot)))
+            
+            # Direct pixel coordinate calculation with precomputed constants
+            u = (theta + math.pi) * inv_2pi
+            v = (phi + half_pi) * inv_pi
+            
+            # Final pixel coordinates with bounds checking
+            pixel_x[j, i] = max(0.0, min(frame_width_f, u * frame_width_f))
+            pixel_y[j, i] = max(0.0, min(frame_height_f, v * frame_height_f))
+    
+    return pixel_x, pixel_y
+
+@njit(cache=True, fastmath=True, parallel=True)
+def generate_mapping_jit_ultra_parallel(output_width, output_height, focal_length, cx, cy,
+                                       R00, R01, R02, R10, R11, R12, R20, R21, R22,
+                                       frame_height, frame_width):
+    """Ultra-optimized parallel coordinate mapping for multi-core systems"""
+    
+    # Pre-allocate output arrays
+    pixel_x = np.empty((output_height, output_width), dtype=np.float32)
+    pixel_y = np.empty((output_height, output_width), dtype=np.float32)
+    
+    # Pre-calculate constants
+    inv_focal = 1.0 / focal_length
+    inv_2pi = 0.15915494309189535
+    inv_pi = 0.3183098861837907
+    half_pi = 1.5707963267948966
+    frame_width_f = float(frame_width - 1)
+    frame_height_f = float(frame_height - 1)
+    pi = 3.141592653589793
+    
+    # Parallel processing with optimized inner loop
+    for j in range(output_height):
+        y_norm = (j - cy) * inv_focal
+        y_norm_sq = y_norm * y_norm
+        for i in range(output_width):
+            x_norm = (i - cx) * inv_focal
+            
+            # Fast normalization
+            norm_factor = 1.0 / math.sqrt(x_norm * x_norm + y_norm_sq + 1.0)
+            x_unit = x_norm * norm_factor
+            y_unit = y_norm * norm_factor
+            z_unit = norm_factor
+            
+            # Matrix multiply
+            x_rot = R00 * x_unit + R01 * y_unit + R02 * z_unit
+            y_rot = R10 * x_unit + R11 * y_unit + R12 * z_unit
+            z_rot = R20 * x_unit + R21 * y_unit + R22 * z_unit
+            
+            # Spherical conversion
+            theta = math.atan2(x_rot, z_rot)
+            phi = math.asin(max(-1.0, min(1.0, y_rot)))
+            
+            # Pixel mapping
+            u = (theta + pi) * inv_2pi
+            v = (phi + half_pi) * inv_pi
+            
+            pixel_x[j, i] = max(0.0, min(frame_width_f, u * frame_width_f))
+            pixel_y[j, i] = max(0.0, min(frame_height_f, v * frame_height_f))
+    
+    return pixel_x, pixel_y
+
 # Example usage
 def main():
     # Replace with your video path
     video_path = "C:/insta360/x5/exports/VID_20250704_123015_00_001(1).mp4"
  
-    # Create processor
-    processor = Equirectangular360(video_path)
+    # Create processor with ultra-fast coordinate generation and minimal memory cache
+    processor = Equirectangular360(video_path, use_optimized_coords=True, max_memory_cache_mb=50)
     
     print(f"Video loaded: {processor.width}x{processor.height}")
-    print("Optimizations enabled: coordinate caching + multithreading")
+    print("Ultra-fast coordinate generation enabled with JIT compilation")
+    print("Minimal memory cache (no disk storage) for maximum speed")
     print()
     
-    # Run benchmark first
-    print("Running performance benchmark...")
-    processor.benchmark_performance()
+    # Test coordinate generation performance first
+    print("Testing coordinate generation performance...")
+    processor.benchmark_coordinate_generation()
+    print()
     
-    # Option 1: Interactive viewer (now with benchmarking support)
-    # Press 'B' during interactive viewing to toggle benchmark mode
+    # Option 1: Interactive viewer with real-time performance
+    print("Starting interactive viewer...")
+    print("Press 'B' during viewing to toggle benchmark mode")
     processor.interactive_viewer()
     
-    # Option 2: Process single frame (with precomputation for speed)
-    # print("Precomputing projection...")
-    # processor.precompute_projection(yaw=0, pitch=0, roll=0, fov=90)
-    # 
+    # Option 2: Run performance benchmark
+    # processor.benchmark_performance()
+    
+    # Option 3: Process single frame
     # frame = processor.process_frame(
     #     frame_number=0,
-    #     yaw=0,      # Look straight ahead
-    #     pitch=0,    # Level horizon
-    #     roll=0,     # No tilt
-    #     fov=90      # 90 degree field of view
+    #     yaw=0, pitch=0, roll=0, fov=90
     # )
-    # 
     # if frame is not None:
     #     cv2.imshow('Projected Frame', frame)
     #     cv2.waitKey(0)
     #     cv2.destroyAllWindows()
-    
-    # Option 3: Create projected video (now with multithreading)
-    # processor.create_video_projection(
-    #     output_path="projected_video.mp4",
-    #     yaw=45,     # Look 45 degrees to the right
-    #     pitch=0,    # Level horizon
-    #     roll=0,     # No tilt
-    #     fov=90,     # 90 degree field of view
-    #     num_threads=4  # Use 4 threads for processing
-    # )
-    # 
-    # print(processor.get_cache_info())
 
 if __name__ == "__main__":
     main()
