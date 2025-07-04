@@ -274,6 +274,8 @@ class Equirectangular360:
         print("C - Clear caches")
         print("I - Show cache info")
         print("ESC - Exit")
+
+        play = False
         
         while True:
             frame_start = time.perf_counter() if benchmark else None
@@ -310,7 +312,7 @@ class Equirectangular360:
                 print(f"Frame Timing - Total: {total_frame_time*1000:.2f}ms ({fps:.1f} FPS) | Read {cache_status}: {read_time*1000:.2f}ms | Display: {display_time*1000:.2f}ms")
                 print("-" * 80)
             
-            key = cv2.waitKey(0) & 0xFF
+            key = cv2.waitKey(1) & 0xFF
             
             if key == 27:  # ESC
                 break
@@ -349,7 +351,15 @@ class Equirectangular360:
             elif key == 81:  # Left arrow
                 frame_idx = max(frame_idx - 1, 0)
             elif key == ord(' '):  # Space - auto play
-                frame_idx = (frame_idx + 1) % self.frame_count
+                play = not play
+
+            if play:
+                # Auto play mode
+                if frame_idx < self.frame_count - 1:
+                    frame_idx = (frame_idx + 1) % self.frame_count
+                else:
+                    frame_idx = 0  # Rewind to the first frame for looping
+                    self.cap.set(cv2.CAP_PROP_POS_FRAMES, 0)  # Reset video position
         
         cv2.destroyAllWindows()
     
@@ -668,6 +678,11 @@ def generate_mapping_jit_ultra_parallel(output_width, output_height, focal_lengt
 
 # Example usage
 def main():
+    """
+    Main function to demonstrate the Equirectangular360 class usage with ultra-fast coordinate generation and minimal memory
+    cache.
+    """
+
     # Replace with your video path
     video_path = "C:/insta360/x5/exports/VID_20250704_123015_00_001(1).mp4"
  
