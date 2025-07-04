@@ -10,12 +10,9 @@ import numba
 numba.config.CACHE_DIR = './numba_cache'
 
 class Equirectangular360:
-    def __init__(self, video_path, use_optimized_coords=True):
+    def __init__(self, video_path):
         self.video_path = video_path
         self.cap = cv2.VideoCapture(video_path)
-        
-        # Optimization settings
-        self.use_optimized_coords = use_optimized_coords
         
         # Optimize video capture settings for speed
         self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)  # Reduce buffer to prevent lag
@@ -675,7 +672,7 @@ def main():
     video_path = "C:/insta360/x5/exports/VID_20250704_123015_00_001(1).mp4"
  
     # Create processor with ultra-fast coordinate generation and minimal memory cache
-    processor = Equirectangular360(video_path, use_optimized_coords=True)
+    processor = Equirectangular360(video_path)
     
     print(f"Video loaded: {processor.width}x{processor.height}")
     print("Ultra-fast coordinate generation enabled with JIT compilation")
