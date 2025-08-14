@@ -4,15 +4,192 @@ import math
 from numba import jit, njit, prange
 import time
 from concurrent.futures import ThreadPoolExecutor
+from abc import ABC, abstractmethod
+from typing import Any, Dict, Optional, Tuple
 
 # Set Numba compilation cache for faster startup
 import numba
 numba.config.CACHE_DIR = './numba_cache'
 
+class FrameProcessor(ABC):
+    """Base class for all frame processors."""
+    
+    def __init__(self):
+        self._parameters = {}
+        
+    @abstractmethod
+    def process(self, frame: np.ndarray) -> np.ndarray:
+        """Process a frame and return the processed frame."""
+        pass
+    
+    def set_parameter(self, name: str, value: Any) -> None:
+        """Set a processing parameter."""
+        self._parameters[name] = value
+        
+    def get_parameter(self, name: str) -> Any:
+        """Get a processing parameter."""
+        return self._parameters.get(name)
+    
+    def get_parameters(self) -> Dict[str, Any]:
+        """Get all processing parameters."""
+        return self._parameters.copy()
+
+
+class Equirectangular2PinholeProcessor(FrameProcessor):
+    """Convert equirectangular 360 frames to pinhole projections."""
+    
+    def __init__(self, fov: float = 90.0, output_width: int = 1920, output_height: int = 1080):
+        super().__init__()
+        self._parameters = {
+            'roll': 0.0,
+            'pitch': 0.0,
+            'yaw': 0.0,
+            'fov': fov,
+            'output_width': output_width,
+            'output_height': output_height
+        }
+        
+        # Coordinate mapping cache
+        self._map_cache = {}
+        self._cache_size_limit = 50
+    
+    def process(self, frame: np.ndarray) -> np.ndarray:
+        """Convert equirectangular frame to pinhole projection."""
+        roll = self._parameters['roll']
+        pitch = self._parameters['pitch']
+        yaw = self._parameters['yaw']
+        fov = self._parameters['fov']
+        output_width = self._parameters['output_width']
+        output_height = self._parameters['output_height']
+        
+        # Normalize angles for consistent caching
+        norm_yaw, norm_pitch, norm_roll = self._normalize_angles(yaw, pitch, roll)
+        
+        # Create cache key for coordinate mapping
+        cache_key = (norm_yaw, norm_pitch, norm_roll, fov, output_width, output_height, frame.shape[0], frame.shape[1])
+        
+        # Check cache for coordinate mapping
+        if cache_key in self._map_cache:
+            pixel_x, pixel_y = self._map_cache[cache_key]
+        else:
+            # Generate new mapping
+            pixel_x, pixel_y = self._generate_coordinate_mapping(
+                norm_yaw, norm_pitch, norm_roll, fov, output_width, output_height, frame.shape
+            )
+            
+            # Cache management
+            if len(self._map_cache) >= self._cache_size_limit:
+                oldest_key = next(iter(self._map_cache))
+                del self._map_cache[oldest_key]
+            
+            self._map_cache[cache_key] = (pixel_x, pixel_y)
+        
+        # Apply remapping
+        return cv2.remap(frame, pixel_x, pixel_y, cv2.INTER_LINEAR, borderMode=cv2.BORDER_WRAP)
+    
+    def _generate_coordinate_mapping(self, yaw: float, pitch: float, roll: float, fov: float, 
+                                   output_width: int, output_height: int, frame_shape: Tuple[int, ...]) -> Tuple[np.ndarray, np.ndarray]:
+        """Generate coordinate mapping for equirectangular to pinhole projection."""
+        # Convert to radians
+        yaw_rad = math.radians(yaw)
+        pitch_rad = math.radians(pitch)
+        roll_rad = math.radians(roll)
+        fov_rad = math.radians(fov)
+        
+        # Pre-calculate constants
+        focal_length = output_width / (2 * math.tan(fov_rad / 2))
+        cx = output_width * 0.5
+        cy = output_height * 0.5
+        
+        # Create rotation matrix elements
+        cos_r, sin_r = math.cos(roll_rad), math.sin(roll_rad)
+        cos_p, sin_p = math.cos(pitch_rad), math.sin(pitch_rad)
+        cos_y, sin_y = math.cos(yaw_rad), math.sin(yaw_rad)
+        
+        # Combined rotation matrix elements
+        R00 = cos_y * cos_r + sin_y * sin_r * sin_p
+        R01 = cos_y * (-sin_r) + sin_y * cos_r * sin_p
+        R02 = sin_y * cos_p
+        R10 = sin_r * cos_p
+        R11 = cos_r * cos_p
+        R12 = -sin_p
+        R20 = -sin_y * cos_r + cos_y * sin_r * sin_p
+        R21 = -sin_y * (-sin_r) + cos_y * cos_r * sin_p
+        R22 = cos_y * cos_p
+        
+        # Choose appropriate JIT implementation based on output size
+        total_pixels = output_width * output_height
+        
+        if total_pixels > 1000000:
+            return generate_mapping_jit_ultra_parallel(
+                output_width, output_height, focal_length, cx, cy,
+                R00, R01, R02, R10, R11, R12, R20, R21, R22,
+                frame_shape[0], frame_shape[1]
+            )
+        elif total_pixels > 500000:
+            return generate_mapping_jit_parallel(
+                output_width, output_height, focal_length, cx, cy,
+                R00, R01, R02, R10, R11, R12, R20, R21, R22,
+                frame_shape[0], frame_shape[1]
+            )
+        elif total_pixels > 200000:
+            return generate_mapping_jit_ultra(
+                output_width, output_height, focal_length, cx, cy,
+                R00, R01, R02, R10, R11, R12, R20, R21, R22,
+                frame_shape[0], frame_shape[1]
+            )
+        else:
+            return generate_mapping_jit(
+                output_width, output_height, focal_length, cx, cy,
+                R00, R01, R02, R10, R11, R12, R20, R21, R22,
+                frame_shape[0], frame_shape[1]
+            )
+    
+    def _normalize_angles(self, yaw: float, pitch: float, roll: float) -> Tuple[float, float, float]:
+        """Normalize angles to canonical ranges for cache consistency."""
+        # Normalize yaw to [0, 360)
+        yaw = yaw % 360
+        
+        # Normalize pitch properly
+        pitch = ((pitch + 180) % 360) - 180
+        
+        # Handle pitch overflow beyond valid range [-90, 90]
+        if pitch > 90:
+            pitch = 180 - pitch
+            yaw = (yaw + 180) % 360
+            roll = (roll + 180) % 360
+        elif pitch < -90:
+            pitch = -180 - pitch
+            yaw = (yaw + 180) % 360
+            roll = (roll + 180) % 360
+        
+        # Normalize roll to [0, 360)
+        roll = roll % 360
+        
+        return yaw, pitch, roll
+    
+    def clear_cache(self) -> None:
+        """Clear the coordinate mapping cache."""
+        self._map_cache.clear()
+
 class Equirectangular360:
-    def __init__(self, video_path):
+    """
+    DEPRECATED: Legacy implementation. Use VideoProcessor with Equirectangular2PinholeProcessor instead.
+    
+    This class is kept for backwards compatibility but it's recommended to use the new 
+    FrameProcessor architecture for better modularity and maintainability.
+    """
+    def __init__(self, video_path, resolution=(1920, 1080), fps=30):
         self.video_path = video_path
-        self.cap = cv2.VideoCapture(video_path)
+        if isinstance(video_path, int):
+            # If video_path is an integer, assume it's a camera index
+            self.cap = cv2.VideoCapture(video_path)
+            # Set camera resolution and FPS
+            self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, 2880)
+            self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 1440)
+            self.cap.set(cv2.CAP_PROP_FPS, 30)
+        else:
+            self.cap = cv2.VideoCapture(video_path)
         
         # Optimize video capture settings for speed
         self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)  # Reduce buffer to prevent lag
@@ -58,7 +235,7 @@ class Equirectangular360:
         # Create cache key for coordinate mapping using normalized angles
         cache_key = (norm_yaw, norm_pitch, norm_roll, fov, output_width, output_height, frame.shape[0], frame.shape[1])
         
-        cache_start = time.perf_counter() if benchmark else None
+        cache_start = time.perf_counter() if benchmark else 0
         # Simple cache lookup
         if cache_key in self._map_cache:
             pixel_x, pixel_y = self._map_cache[cache_key]
@@ -354,12 +531,16 @@ class Equirectangular360:
                 play = not play
 
             if play:
-                # Auto play mode
-                if frame_idx < self.frame_count - 1:
-                    frame_idx = (frame_idx + 1) % self.frame_count
+                # Auto play mode                
+                if isinstance(self.video_path, int):
+                    # If using camera, just increment frame index
+                    pass
                 else:
-                    frame_idx = 0  # Rewind to the first frame for looping
-                    self.cap.set(cv2.CAP_PROP_POS_FRAMES, 0)  # Reset video position
+                    if frame_idx < self.frame_count - 1:
+                        frame_idx = (frame_idx + 1) % self.frame_count
+                    else:
+                        frame_idx = 0  # Rewind to the first frame for looping
+                        self.cap.set(cv2.CAP_PROP_POS_FRAMES, 0)  # Reset video position
         
         cv2.destroyAllWindows()
     
@@ -395,23 +576,31 @@ class Equirectangular360:
             frame = self._frame_cache[frame_number]
             cache_hit = True
         else:
-            # Read from video
-            self.cap.set(cv2.CAP_PROP_POS_FRAMES, frame_number)
-            ret, frame = self.cap.read()
             
-            if not ret:
-                return None, None if benchmark else None
-            
-            # Cache the frame if we have space
-            if len(self._frame_cache) < self._frame_cache_limit:
-                self._frame_cache[frame_number] = frame.copy()
-            elif len(self._frame_cache) >= self._frame_cache_limit:
-                # Remove oldest cached frame to make space
-                oldest_key = min(self._frame_cache.keys())
-                del self._frame_cache[oldest_key]
-                self._frame_cache[frame_number] = frame.copy()
-            
-            cache_hit = False
+            if isinstance(self.video_path, int):
+                # For camera input, just read the current frame
+                ret, frame = self.cap.read()
+                if not ret:
+                    return None, None if benchmark else None
+                cache_hit = False
+            else:
+                # Read from video
+                self.cap.set(cv2.CAP_PROP_POS_FRAMES, frame_number)
+                ret, frame = self.cap.read()
+                
+                if not ret:
+                    return None, None if benchmark else None
+                
+                # Cache the frame if we have space
+                if len(self._frame_cache) < self._frame_cache_limit:
+                    self._frame_cache[frame_number] = frame.copy()
+                elif len(self._frame_cache) >= self._frame_cache_limit:
+                    # Remove oldest cached frame to make space
+                    oldest_key = min(self._frame_cache.keys())
+                    del self._frame_cache[oldest_key]
+                    self._frame_cache[frame_number] = frame.copy()
+                
+                cache_hit = False
         
         read_time = time.perf_counter() - read_start if benchmark else None
         
@@ -676,28 +865,252 @@ def generate_mapping_jit_ultra_parallel(output_width, output_height, focal_lengt
     
     return pixel_x, pixel_y
 
+class VideoProcessor:
+    """Handles video I/O and applies frame processing using FrameProcessor instances."""
+    
+    def __init__(self, video_path, frame_processor: FrameProcessor):
+        self.video_path = video_path
+        self.frame_processor = frame_processor
+        
+        if isinstance(video_path, int):
+            # Camera input
+            self.cap = cv2.VideoCapture(video_path)
+            self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, 2880)
+            self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 1440)
+            self.cap.set(cv2.CAP_PROP_FPS, 30)
+        else:
+            # File input
+            self.cap = cv2.VideoCapture(video_path)
+        
+        # Optimize video capture settings
+        self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+        
+        # Frame cache for faster access
+        self._frame_cache = {}
+        self._frame_cache_limit = 30
+        
+        # Get video properties
+        self.fps = self.cap.get(cv2.CAP_PROP_FPS)
+        self.frame_count = int(self.cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        self.width = int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        self.height = int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        
+        print(f"Video: {self.width}x{self.height}, {self.fps} fps, {self.frame_count} frames")
+    
+    def process_frame(self, frame_number: int) -> Optional[np.ndarray]:
+        """Process a specific frame using the frame processor."""
+        frame = self.get_frame(frame_number)
+        if frame is None:
+            return None
+        return self.frame_processor.process(frame)
+    
+    def interactive_viewer(self, benchmark: bool = False):
+        """Interactive viewer with keyboard controls."""
+        frame_idx = 0
+        
+        print("Controls:")
+        print("A/D - Adjust yaw (left/right)")
+        print("W/S - Adjust pitch (up/down)")
+        print("Q/E - Adjust roll")
+        print("Z/X - Adjust FOV")
+        print("Left/Right arrows - Navigate frames")
+        print("B - Toggle benchmark timing")
+        print("P - Preload next 30 frames")
+        print("C - Clear caches")
+        print("I - Show cache info")
+        print("ESC - Exit")
+
+        play = False
+        
+        while True:
+            frame_start = time.perf_counter() if benchmark else None
+            
+            # Get frame
+            frame = self.get_frame(frame_idx)
+            if frame is None:
+                break
+            
+            # Process frame
+            processed_frame = self.frame_processor.process(frame)
+            
+            # Display info
+            params = self.frame_processor.get_parameters()
+            yaw = params.get('yaw', 0)
+            pitch = params.get('pitch', 0)
+            roll = params.get('roll', 0)
+            fov = params.get('fov', 90)
+            
+            info_text = f"Frame: {frame_idx} | Yaw: {yaw:.1f}° | Pitch: {pitch:.1f}° | Roll: {roll:.1f}° | FOV: {fov:.1f}°"
+            cv2.putText(processed_frame, info_text, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+            
+            # Add cache info to display
+            if isinstance(self.frame_processor, Equirectangular2PinholeProcessor):
+                cache_info = f"Frame: {len(self._frame_cache)}/{self._frame_cache_limit} | Coord: {len(self.frame_processor._map_cache)}/{self.frame_processor._cache_size_limit}"
+                cv2.putText(processed_frame, cache_info, (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1)
+            
+            cv2.imshow('360 Video Processor', processed_frame)
+            
+            total_frame_time = time.perf_counter() - frame_start if benchmark and frame_start else None
+            
+            if benchmark and total_frame_time:
+                fps = 1.0 / total_frame_time if total_frame_time > 0 else 0
+                print(f"Frame Timing - Total: {total_frame_time*1000:.2f}ms ({fps:.1f} FPS)")
+            
+            key = cv2.waitKey(1) & 0xFF
+            
+            if key == 27:  # ESC
+                break
+            elif key == ord('a'):
+                yaw = self.frame_processor.get_parameter('yaw') - 5
+                self.frame_processor.set_parameter('yaw', yaw)
+            elif key == ord('d'):
+                yaw = self.frame_processor.get_parameter('yaw') + 5
+                self.frame_processor.set_parameter('yaw', yaw)
+            elif key == ord('w'):
+                pitch = self.frame_processor.get_parameter('pitch') + 5
+                self.frame_processor.set_parameter('pitch', pitch)
+            elif key == ord('s'):
+                pitch = self.frame_processor.get_parameter('pitch') - 5
+                self.frame_processor.set_parameter('pitch', pitch)
+            elif key == ord('q'):
+                roll = self.frame_processor.get_parameter('roll') - 5
+                self.frame_processor.set_parameter('roll', roll)
+            elif key == ord('e'):
+                roll = self.frame_processor.get_parameter('roll') + 5
+                self.frame_processor.set_parameter('roll', roll)
+            elif key == ord('z'):
+                fov = max(10, self.frame_processor.get_parameter('fov') - 5)
+                self.frame_processor.set_parameter('fov', fov)
+            elif key == ord('x'):
+                fov = min(360, self.frame_processor.get_parameter('fov') + 5)
+                self.frame_processor.set_parameter('fov', fov)
+            elif key == ord('b'):
+                benchmark = not benchmark
+                print(f"Benchmark mode: {'ON' if benchmark else 'OFF'}")
+            elif key == ord('p'):
+                # Preload next frames
+                end_frame = min(frame_idx + self._frame_cache_limit, self.frame_count - 1)
+                self.preload_frames(frame_idx, end_frame)
+            elif key == ord('c'):
+                # Clear all caches
+                self.clear_cache()
+                if isinstance(self.frame_processor, Equirectangular2PinholeProcessor):
+                    self.frame_processor.clear_cache()
+                print("All caches cleared")
+            elif key == ord('i'):
+                # Show cache info
+                print(self.get_cache_info())
+            elif key == 83:  # Right arrow
+                frame_idx = min(frame_idx + 1, self.frame_count - 1)
+            elif key == 81:  # Left arrow
+                frame_idx = max(frame_idx - 1, 0)
+            elif key == ord(' '):  # Space - auto play
+                play = not play
+
+            if play:
+                if isinstance(self.video_path, int):
+                    pass  # Camera input
+                else:
+                    if frame_idx < self.frame_count - 1:
+                        frame_idx = (frame_idx + 1) % self.frame_count
+                    else:
+                        frame_idx = 0
+                        self.cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+        
+        cv2.destroyAllWindows()
+    
+    def get_frame(self, frame_number: int) -> Optional[np.ndarray]:
+        """Get a frame from the video with caching."""
+        # Check frame cache first
+        if frame_number in self._frame_cache:
+            return self._frame_cache[frame_number]
+        
+        if isinstance(self.video_path, int):
+            # Camera input
+            ret, frame = self.cap.read()
+            if not ret:
+                return None
+        else:
+            # File input
+            self.cap.set(cv2.CAP_PROP_POS_FRAMES, frame_number)
+            ret, frame = self.cap.read()
+            
+            if not ret:
+                return None
+            
+            # Cache management
+            if len(self._frame_cache) >= self._frame_cache_limit:
+                oldest_key = min(self._frame_cache.keys())
+                del self._frame_cache[oldest_key]
+            
+            self._frame_cache[frame_number] = frame.copy()
+        
+        return frame
+    
+    def preload_frames(self, start_frame: int, end_frame: int):
+        """Preload a range of frames into cache."""
+        print(f"Preloading frames {start_frame} to {end_frame}...")
+        
+        self._frame_cache.clear()
+        frames_to_load = min(end_frame - start_frame + 1, self._frame_cache_limit)
+        
+        for i in range(start_frame, start_frame + frames_to_load):
+            if i >= self.frame_count:
+                break
+                
+            self.cap.set(cv2.CAP_PROP_POS_FRAMES, i)
+            ret, frame = self.cap.read()
+            
+            if ret:
+                self._frame_cache[i] = frame.copy()
+            
+            if i % 10 == 0:
+                print(f"  Loaded frame {i}/{start_frame + frames_to_load - 1}")
+        
+        print(f"Preloaded {len(self._frame_cache)} frames into cache")
+    
+    def clear_cache(self):
+        """Clear frame cache."""
+        self._frame_cache.clear()
+    
+    def get_cache_info(self):
+        """Get information about the frame cache."""
+        frame_cache_mb = sum(frame.nbytes for frame in self._frame_cache.values()) / (1024 * 1024) if self._frame_cache else 0
+        return f"Frame cache: {len(self._frame_cache)} frames ({frame_cache_mb:.1f} MB)"
+    
+    def __del__(self):
+        if hasattr(self, 'cap'):
+            self.cap.release()
+
 # Example usage
 def main():
     """
-    Main function to demonstrate the Equirectangular360 class usage with ultra-fast coordinate generation and minimal memory
-    cache.
+    Main function to demonstrate the new processor architecture.
     """
-
-    # Replace with your video path
-    video_path = "C:/insta360/x5/exports/VID_20250704_123015_00_001(1).mp4"
- 
-    # Create processor with ultra-fast coordinate generation and minimal memory cache
-    processor = Equirectangular360(video_path)
     
-    print(f"Video loaded: {processor.width}x{processor.height}")
-    print("Ultra-fast coordinate generation enabled with JIT compilation")
-    print("Minimal memory cache (no disk storage) for maximum speed")
+    # Replace with your video path or use 0 for camera
+    video_path = "C:/insta360/x5/exports/VID_20250704_123015_00_001(1).mp4"
+    # video_path = 0  # For camera input
+    
+    # Create the frame processor with desired settings
+    frame_processor = Equirectangular2PinholeProcessor(
+        fov=90.0,
+        output_width=1920,
+        output_height=1080
+    )
+    
+    # Create video processor with the frame processor
+    video_processor = VideoProcessor(video_path, frame_processor)
+    
+    print(f"Video loaded: {video_processor.width}x{video_processor.height}")
+    print("Frame processor architecture enabled")
+    print("Ultra-fast coordinate generation with JIT compilation")
     print()
     
     # Interactive viewer with real-time performance
     print("Starting interactive viewer...")
     print("Press 'B' during viewing to toggle benchmark mode")
-    processor.interactive_viewer()
+    video_processor.interactive_viewer()
 
 if __name__ == "__main__":
     main()
